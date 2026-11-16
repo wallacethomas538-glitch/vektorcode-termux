@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.db
+*.log
+.venv/
+.venv-voice/
+venv/
+env/
+.env
+.DS_Store
+voice_agent/models/
