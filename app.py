@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 
 from vektor_cloud import composio_mcp, mcp_client
+from vektor_cloud.skills import (discover_skills, format_skill_for_prompt,
+                                 load_skill, load_skill_reference)
 from vektor_cloud.egress import (EgressBlocked, guard_url, load_mcp_hosts,
                                 vektor_http)
 from vektor_cloud.storage import (DashboardStore, MEMORY_KINDS,
@@ -338,6 +340,19 @@ WEB_TOOL_SCHEMAS = [
                                    "api.github.com)"}},
             "required": ["url"]}}},
 ]
+# Read-only companion to a loaded skill: one reference file from
+# inside an installed skill, jailed to that skill's directory.
+READ_SKILL_REFERENCE_SCHEMA = {"type": "function", "function": {
+    "name": "read_skill_reference",
+    "description": ("Read one reference file from inside an installed "
+                    "skill (read-only, jailed to the skill directory). "
+                    "Use it for the reference files a loaded skill names."),
+    "parameters": {"type": "object", "properties": {
+        "skill": {"type": "string",
+                  "description": "Skill slug, e.g. hypit"},
+        "reference": {"type": "string",
+                      "description": "Path relative to the skill directory, e.g. references/environment/distribution.md"}},
+        "required": ["skill", "reference"]}}}
 # A model can emit tool_calls for any name, so write-capable names are
 # refused before any network call. Substrings, uppercased. The Composio
 # meta-tools are exempt: they are the sanctioned discovery path when
@@ -676,6 +691,19 @@ def _tool_status(tool_id):
     return "Registered, not executable"
 
 
+def resolve_invoked_skill(data, messages):
+    """Skill slug from a chat payload: an explicit "skill" field, or a
+    leading "/skill <slug>" in the latest user message. None when the
+    turn invokes no skill."""
+    if isinstance(data.get("skill"), str) and data["skill"].strip():
+        return data["skill"].strip()
+    last_user = next(
+        (m.get("content", "") for m in reversed(messages)
+         if m.get("role") == "user"), "")
+    match = re.match(r"\s*/skill\s+([A-Za-z0-9_-]+)", last_user or "")
+    return match.group(1) if match else None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
     def send_json(self, value, status=200):
@@ -755,6 +783,21 @@ class Handler(BaseHTTPRequestHandler):
                 return ({"ok": False, "error": "Web research tool is disabled"},
                         name)
             return self._run_web_tool(name, args, sid)
+        if name == "read_skill_reference":
+            skill = args.get("skill", "")
+            reference = args.get("reference", "")
+            if not isinstance(skill, str) or not isinstance(reference, str):
+                return ({"ok": False,
+                         "error": "skill and reference must be strings"},
+                        name)
+            ref = load_skill_reference(ROOT, VEKTOR_STATE, skill, reference)
+            if ref is None:
+                return ({"ok": False,
+                         "error": "Reference not found (or escapes the "
+                                  "skill directory)"}, name)
+            return ({"ok": True, "skill": ref["skill"],
+                     "reference": ref["reference"],
+                     "content": ref["content"]}, name)
         # Composio meta-tools (two-hop): check the discovered tool at
         # execution time — the meta-tool name itself is exempt, the tool
         # it is about to run is not.
@@ -825,7 +868,7 @@ class Handler(BaseHTTPRequestHandler):
         return call_mcp_tool(name, args, server="composio"), name
 
     def _resolve_tools(self, result, endpoint, headers, model,
-                       llm_messages, sid=None):
+                       llm_messages, sid=None, skill_slug=None):
         """Run tool-call rounds for one provider reply, up to
         MAX_TOOL_ROUNDS. Returns (message, tools_used).
 
@@ -871,7 +914,7 @@ class Handler(BaseHTTPRequestHandler):
             follow = messages + [{"role": "assistant", "tool_calls": tool_calls}] + tool_results
             payload = json.dumps({"model": model, "messages": follow,
                                   "stream": False,
-                                  "tools": self._declared_tools()}).encode()
+                                  "tools": self._declared_tools(skill_slug)}).encode()
             guard_url(endpoint)  # egress check on the follow-up call too
             req = Request(endpoint, data=payload, headers=headers, method="POST")
             with urlopen(req, timeout=120) as response:
@@ -948,14 +991,19 @@ class Handler(BaseHTTPRequestHandler):
                 break
         return schemas
 
-    def _declared_tools(self):
+    def _declared_tools(self, skill_slug=None):
         """Tool schemas sent to the model in chat payloads: the union of
         the native read-only web tools, the Composio meta-tools, and the
-        namespaced schemas of every enabled + exposed MCP server."""
+        namespaced schemas of every enabled + exposed MCP server. The
+        skill-reference schema appears only when a skill is loaded
+        for this turn (so a turn with no skill declares no extra tools)."""
         enabled = set(self.setting("tools", []))
         tools = []
         if "web" in enabled:
             tools.extend(WEB_TOOL_SCHEMAS)
+        if (skill_slug is not None
+                and load_skill(ROOT, VEKTOR_STATE, skill_slug) is not None):
+            tools.append(READ_SKILL_REFERENCE_SCHEMA)
         if "composio" in enabled:
             tools.extend(self._composio_meta_schemas())
         for cfg in _mcp_configs():
@@ -1065,6 +1113,29 @@ class Handler(BaseHTTPRequestHandler):
         llm_messages = [{"role": "system", "content": system_prompt}] + [
             {"role": m["role"], "content": m["content"]} for m in history]
 
+        # --- Skill invocation: /skill <slug> loads an installed skill ---
+        # Also accepts an explicit "skill" field in the chat payload.
+        # The loaded skill becomes a second system message, so the model
+        # follows it for this turn. An unknown slug is reported to the
+        # model (with the installed list) instead of failing silently.
+        skill_slug = resolve_invoked_skill(data, messages)
+        if skill_slug:
+            skill = load_skill(ROOT, VEKTOR_STATE, skill_slug)
+            if skill is not None:
+                llm_messages.append(
+                    {"role": "system",
+                     "content": format_skill_for_prompt(skill)})
+            else:
+                installed = ", ".join(
+                    s["slug"] for s in discover_skills(ROOT, VEKTOR_STATE)
+                ) or "none"
+                llm_messages.append(
+                    {"role": "system",
+                     "content": (f"Wallace asked for skill '{skill_slug}', "
+                                 f"but it is not installed. Installed "
+                                 f"skills: {installed}. Tell him so and "
+                                 f"offer to help without it.")})
+
         keys = [k for k in KEY_POOLS.get(pid, []) if k.strip()]
         if pid == "local":
             # Local Ollama needs no API key; an empty key means "no auth header".
@@ -1100,11 +1171,11 @@ class Handler(BaseHTTPRequestHandler):
                                _provider_endpoint(self, fpid), fkeys, frotate))
 
         if data.get("stream"):
-            self._chat_stream(sid, candidates, llm_messages)
+            self._chat_stream(sid, candidates, llm_messages, skill_slug)
             return
-        self._chat_once(sid, candidates, llm_messages)
+        self._chat_once(sid, candidates, llm_messages, skill_slug)
 
-    def _chat_once(self, sid, candidates, llm_messages):
+    def _chat_once(self, sid, candidates, llm_messages, skill_slug=None):
         """Non-streaming chat: try each candidate provider in order.
 
         Within a provider, rotate through its key pool on
@@ -1126,13 +1197,13 @@ class Handler(BaseHTTPRequestHandler):
                            "User-Agent": LLM_USER_AGENT}
                 if key:
                     headers["Authorization"] = "Bearer " + key
-                payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools()}).encode()
+                payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools(skill_slug)}).encode()
                 try:
                     guard_url(endpoint)  # egress guard on the chat path
                     req = Request(endpoint, data=payload, headers=headers, method="POST")
                     with urlopen(req, timeout=30) as response:
                         result = json.loads(response.read())
-                    message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid)
+                    message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid, skill_slug)
                     if not isinstance(message, str) or not message.strip():
                         continue
                     latency = round((time.time() - started) * 1000)
@@ -1158,7 +1229,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
         self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid, "attempts": attempt_errors}, last_status)
 
-    def _chat_stream(self, sid, candidates, llm_messages):
+    def _chat_stream(self, sid, candidates, llm_messages, skill_slug=None):
         """Streaming chat: SSE tokens, with a full-reply fallback.
 
         Tries each candidate provider in order (same fallback as
@@ -1186,7 +1257,7 @@ class Handler(BaseHTTPRequestHandler):
                            "User-Agent": LLM_USER_AGENT}
                 if key:
                     headers["Authorization"] = "Bearer " + key
-                payload = json.dumps({"model": model, "messages": llm_messages, "stream": True, "tools": self._declared_tools()}).encode()
+                payload = json.dumps({"model": model, "messages": llm_messages, "stream": True, "tools": self._declared_tools(skill_slug)}).encode()
                 try:
                     guard_url(endpoint)  # egress guard on the chat path
                 except EgressBlocked as exc:
@@ -1221,7 +1292,7 @@ class Handler(BaseHTTPRequestHandler):
                         if "text/event-stream" not in ctype:
                             # Fallback: provider returned a complete JSON reply.
                             result = json.loads(response.read())
-                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid)
+                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid, skill_slug)
                             if isinstance(message, str) and message.strip():
                                 self._sse({"type": "delta", "content": message})
                                 self._finish_stream(sid, provider, model, message, tools_used, started)
@@ -1251,11 +1322,11 @@ class Handler(BaseHTTPRequestHandler):
                         if tool_calls_seen:
                             # Redo the turn non-streaming to get complete
                             # tool calls, run them, emit the final message.
-                            follow_payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools()}).encode()
+                            follow_payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools(skill_slug)}).encode()
                             req = Request(endpoint, data=follow_payload, headers=headers, method="POST")
                             with urlopen(req, timeout=120) as follow_resp:
                                 result = json.loads(follow_resp.read())
-                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid)
+                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid, skill_slug)
                             if isinstance(message, str) and message.strip():
                                 self._sse({"type": "delta", "content": message})
                                 self._finish_stream(sid, provider, model, message, tools_used, started)
@@ -1474,7 +1545,9 @@ class Handler(BaseHTTPRequestHandler):
             auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
             authenticated = require_auth(self)
             mcp = mcp_status()
-            self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"status":_tool_status(a),"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "mcp_servers":mcp_status_all(), "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+            self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"status":_tool_status(a),"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "mcp_servers":mcp_status_all(), "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "skills":discover_skills(ROOT, VEKTOR_STATE), "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+        if self.path == "/api/skills":
+            self.send_json({"skills": discover_skills(ROOT, VEKTOR_STATE)}); return
         if self.path == "/api/voice/status":
             try:
                 from voice_agent.config import VoiceConfig
@@ -1605,7 +1678,7 @@ class Handler(BaseHTTPRequestHandler):
             target = VEKTOR_STATE / "skills" / f"{slug}.md"
             append_shared_file(target, heading, content)
             receipt("skill_saved", {"path":str(target),"title":heading}, True, True)
-            self.send_json({"ok":True,"path":str(target)}); return
+            self.send_json({"ok":True,"path":str(target),"slug":slug,"loadable":True}); return
         if path == "/api/login":
             expected = os.environ.get("VEKTORCODE_TOOL_PASSWORD")
             ok = not expected or secrets.compare_digest(str(data.get("password","")), expected)
